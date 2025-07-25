@@ -1,56 +1,89 @@
-import os
-import json
-import pdfplumber
 import fitz  # PyMuPDF
+import json
+import os
 
-INPUT_DIR = "input"
-OUTPUT_DIR = "output"
+def extract_headings_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    headings = []
+    title = None
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+    # Store average font sizes for dynamic classification
+    font_sizes = []
 
-def extract_text_pymupdf(pdf_path):
-    """Extract text using PyMuPDF"""
-    text = ""
-    with fitz.open(pdf_path) as doc:
-        for page in doc:
-            text += page.get_text()
-    return text.strip()
+    # Pass 1: Collect all font sizes
+    for page in doc:
+        blocks = page.get_text("dict")["blocks"]
+        for b in blocks:
+            if "lines" in b:
+                for l in b["lines"]:
+                    for s in l["spans"]:
+                        if s["size"] > 5:  # ignore very small footnotes
+                            font_sizes.append(s["size"])
 
-def extract_tables_pdfplumber(pdf_path):
-    """Extract tables using pdfplumber"""
-    tables_data = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            tables = page.extract_tables()
-            for table in tables:
-                tables_data.append(table)
-    return tables_data
+    # Determine thresholds for H1, H2, H3 dynamically
+    unique_sizes = sorted(list(set(font_sizes)), reverse=True)
+    h1_size = unique_sizes[0] if unique_sizes else 0
+    h2_size = unique_sizes[1] if len(unique_sizes) > 1 else h1_size - 1
+    h3_size = unique_sizes[2] if len(unique_sizes) > 2 else h2_size - 1
 
-def process_pdf(pdf_file):
-    pdf_path = os.path.join(INPUT_DIR, pdf_file)
-    extracted_text = extract_text_pymupdf(pdf_path)
-    extracted_tables = extract_tables_pdfplumber(pdf_path)
+    # Pass 2: Extract headings
+    for page_num, page in enumerate(doc, start=1):
+        blocks = page.get_text("dict")["blocks"]
+        for b in blocks:
+            if "lines" in b:
+                for l in b["lines"]:
+                    for s in l["spans"]:
+                        text = s["text"].strip()
+                        size = s["size"]
 
-    output_data = {
-        "file_name": pdf_file,
-        "text": extracted_text,
-        "tables": extracted_tables
-    }
+                        if not text or len(text.split()) > 15:
+                            continue  # skip long paragraphs
 
-    output_path = os.path.join(OUTPUT_DIR, f"{pdf_file.replace('.pdf', '')}.json")
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(output_data, f, indent=4, ensure_ascii=False)
+                        level = None
+                        if size >= h1_size:
+                            level = "H1"
+                            if title is None:
+                                title = text  # first H1 becomes title
+                        elif h2_size <= size < h1_size:
+                            level = "H2"
+                        elif h3_size <= size < h2_size:
+                            level = "H3"
 
-    print(f"✅ Processed: {pdf_file} → {output_path}")
+                        if level:
+                            headings.append({
+                                "level": level,
+                                "text": text,
+                                "page": page_num
+                            })
 
-def main():
-    pdf_files = [f for f in os.listdir(INPUT_DIR) if f.endswith(".pdf")]
-    if not pdf_files:
-        print("❌ No PDF files found in the input folder.")
-        return
+    # Default title if not found
+    if title is None and headings:
+        title = headings[0]["text"]
+    elif title is None:
+        title = os.path.basename(pdf_path)
 
-    for pdf_file in pdf_files:
-        process_pdf(pdf_file)
+    return {"title": title, "outline": headings}
+
+
+def process_pdfs(input_dir, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    for file in os.listdir(input_dir):
+        if file.lower().endswith(".pdf"):
+            pdf_path = os.path.join(input_dir, file)
+            result = extract_headings_from_pdf(pdf_path)
+            json_filename = os.path.splitext(file)[0] + ".json"
+            json_path = os.path.join(output_dir, json_filename)
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=4, ensure_ascii=False)
+            print(f"Processed {file} → {json_filename}")
+
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Extract PDF headings (H1, H2, H3) and generate JSON.")
+    parser.add_argument("--input", type=str, default="input", help="Input folder containing PDFs")
+    parser.add_argument("--output", type=str, default="output", help="Output folder for JSONs")
+    args = parser.parse_args()
+
+    process_pdfs(args.input, args.output)
